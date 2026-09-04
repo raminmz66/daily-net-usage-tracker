@@ -1,0 +1,11 @@
+.dnu-label {
+    padding: 0 4px;
+    /* A floor on the width stops the panel shuffling every time a digit
+       changes; wider values simply grow past it. */
+    min-width: 62px;
+}
+
+.dnu-menu-value {
+    padding-left: 24px;
+    font-weight: bold;
+}
