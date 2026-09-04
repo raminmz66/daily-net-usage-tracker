@@ -12,9 +12,9 @@ const Accumulator = Me.imports.lib.accumulator;
 const Counters = Me.imports.lib.counters;
 const Format = Me.imports.lib.format;
 const Store = Me.imports.lib.store;
+const System = Me.imports.lib.system;
 
-const POLL_SECONDS = 5;
-const SAVE_INTERVAL_SECONDS = 15;
+const POLL_SECONDS = 30;
 const STATE_DIR = 'daily-net-usage-tracker';
 const STATE_FILE = 'usage.json';
 
@@ -24,10 +24,6 @@ function statePath() {
 
 function today() {
     return GLib.DateTime.new_now_local().format('%Y-%m-%d');
-}
-
-function monotonicSeconds() {
-    return GLib.get_monotonic_time() / 1000000;
 }
 
 const UsageIndicator = GObject.registerClass(
@@ -42,31 +38,39 @@ class UsageIndicator extends PanelMenu.Button {
         });
         this.add_child(this._label);
 
-        this._statePath = statePath();
-        const stored = Store.load(this._statePath) ?? { date: today(), rx: 0, tx: 0 };
-        this._accumulator = new Accumulator.Accumulator(stored);
-        this._dirty = false;
-        this._lastSaved = monotonicSeconds();
-
         this._download = this._addRow('Download');
         this._upload = this._addRow('Upload');
-        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        const resetItem = new PopupMenu.PopupMenuItem("Reset today's count");
-        resetItem.connect('activate', () => {
-            this._accumulator.reset(today());
-            this._dirty = true;
-            this._save(true);
-            this._render();
-        });
-        this.menu.addMenuItem(resetItem);
+        this._statePath = statePath();
+        this._accumulator = this._resume();
+        this._render();
+        this._save();
 
-        this._tick();
         this._timeoutId = GLib.timeout_add_seconds(
             GLib.PRIORITY_DEFAULT, POLL_SECONDS, () => {
                 this._tick();
                 return GLib.SOURCE_CONTINUE;
             });
+    }
+
+    /* Rebuild the day's totals from the saved state plus whatever the counters
+     * say now, crediting traffic that happened while we were not running. */
+    _resume() {
+        let stored = null;
+        let samples = {};
+        let bootId = null;
+        let bootDate = null;
+        try {
+            stored = Store.load(this._statePath);
+            samples = Counters.sample();
+            bootId = System.bootId();
+            bootDate = System.bootDate();
+        } catch (e) {
+            logError(e, 'daily-net-usage-tracker: could not read startup state');
+        }
+        return Accumulator.Accumulator.resume({
+            stored, samples, bootId, bootDate, today: today(),
+        });
     }
 
     _addRow(name) {
@@ -90,14 +94,15 @@ class UsageIndicator extends PanelMenu.Button {
     _tick() {
         // Nothing in here may throw: an exception in a shell timer is an
         // exception in the shell's main loop.
+        let changed = false;
         try {
-            if (this._accumulator.update(Counters.sample(), today()))
-                this._dirty = true;
+            changed = this._accumulator.update(Counters.sample(), today());
         } catch (e) {
             logError(e, 'daily-net-usage-tracker: could not read counters');
         }
         this._render();
-        this._save(false);
+        if (changed)
+            this._save();
     }
 
     _render() {
@@ -107,19 +112,11 @@ class UsageIndicator extends PanelMenu.Button {
         this._upload.text = Format.formatBytes(tx);
     }
 
-    /* Throttled so a busy connection does not rewrite the file every tick.
-     * A failed write is logged and retried on the next tick, since _dirty
-     * stays set. */
-    _save(force) {
-        if (!this._dirty)
-            return;
-        const now = monotonicSeconds();
-        if (!force && now - this._lastSaved < SAVE_INTERVAL_SECONDS)
-            return;
+    /* Saving every tick rather than on a slower timer keeps the loss from an
+     * unclean shutdown down to one poll interval, and the file is ~200 bytes. */
+    _save() {
         try {
             Store.save(this._statePath, this._accumulator.toState());
-            this._lastSaved = now;
-            this._dirty = false;
         } catch (e) {
             logError(e, 'daily-net-usage-tracker: could not save usage');
         }
@@ -130,7 +127,7 @@ class UsageIndicator extends PanelMenu.Button {
             GLib.source_remove(this._timeoutId);
             this._timeoutId = 0;
         }
-        this._save(true);
+        this._save();
         super.destroy();
     }
 });

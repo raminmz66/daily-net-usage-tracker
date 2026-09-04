@@ -11,8 +11,6 @@ in the top bar.
                                    ┌─────────▼──────────┐
                                    │ Download    3.8 GB │
                                    │ Upload      0.4 GB │
-                                   ├────────────────────┤
-                                   │ Reset today's count│
                                    └────────────────────┘
 ```
 
@@ -66,32 +64,52 @@ Sizes use decimal units (1 kB = 1000 B), the same convention data plans quote.
 
 ## How it works
 
-The extension polls `/sys/class/net/<iface>/statistics/{rx,tx}_bytes` every
-five seconds and adds the difference since the previous poll to the day's
-running total.
+The kernel cannot tell you how much data moved today. `rx_bytes` is a single
+running total since the interface came up, with no time dimension attached and
+no timestamped ledger anywhere behind it. So any daily figure has to come from
+something that samples that counter and remembers. The only questions are how
+early the sampling starts and what survives between runs.
 
-Polling deltas rather than reading a single number matters, because those
-kernel counters restart at zero whenever an interface goes down and up, a
-driver reloads, or the machine reboots. When a counter comes back lower than
-last time, the extension treats the whole current value as new traffic instead
-of recording a negative delta.
+The extension polls `/sys/class/net/<iface>/statistics/{rx,tx}_bytes` every 30
+seconds and adds the difference since the previous poll. Deltas rather than
+absolute readings, because those counters restart at zero whenever an interface
+goes down and up, a driver reloads, or the machine reboots; a counter that came
+back lower is treated as a reset rather than a negative delta.
 
-Totals are written to `~/.local/share/daily-net-usage-tracker/usage.json` at
-most once every 15 seconds, and always when the extension shuts down:
+State lives in `~/.local/share/daily-net-usage-tracker/usage.json`, written
+every poll and on shutdown:
 
 ```json
-{ "date": "2026-09-04", "rx": 4083201234, "tx": 391822104 }
+{ "date": "2026-09-05", "rx": 4083201234, "tx": 391822104,
+  "boot_id": "3cec499a-86d5-4a5d-891f-f2d11a44375d",
+  "counters": { "wlp3s0": { "rx": 914913129, "tx": 216618694 } } }
 ```
 
 The write goes through `g_file_set_contents`, which writes a temporary file and
-renames it, so an unclean shutdown cannot leave the state truncated. A file
-that is missing, corrupt, or dated to an earlier day simply starts the day at
-zero.
+renames it, so an unclean shutdown cannot leave the state truncated.
 
-Per-interface baselines are held in memory only. After a reboot or a shell
-restart the extension re-baselines from the current counters — traffic that
-flowed while it was not running is not counted — but the day's total is
-reloaded from disk, so the number picks up where it left off.
+### Recovering time it was not running
+
+Saving the counter positions alongside the totals — plus the boot ID and, from
+`btime` in `/proc/stat`, when the machine booted — is what lets the extension
+account for traffic that flowed while it was asleep. On startup, per interface:
+
+| Situation | What it does |
+|---|---|
+| Same boot, we saved earlier today | The counter never restarted, so the difference since our saved reading is today's traffic. **Credit all of it.** |
+| Same boot, counter came back lower | The interface restarted after a save we made today, so everything it shows is today's. **Credit all of it.** |
+| Different boot, machine booted today | The counter restarted at boot and boot was after midnight. **Credit the whole counter**, on top of anything banked earlier today. This is what picks up the boot-to-login window. |
+| Different boot, machine booted before midnight | The counter spans midnight with nothing marking the boundary. **Credit nothing** and count from here. |
+
+Only the last row loses anything, and reaching it takes a specific shape: the
+machine awake but **logged out** across midnight. Shut down instead and the
+next boot lands in row three, which is exact. Stay logged in and the extension
+rolls the day over live. Suspend and it rolls over on resume.
+
+So a machine that is powered off overnight, and powered off and on again during
+the day, gets an exact daily figure. What remains unrecoverable is at most one
+poll interval of traffic before an unclean shutdown, since the next boot's
+counter starts from zero.
 
 ### Layout
 
@@ -100,22 +118,24 @@ extension/
   extension.js        panel button, poll timer, wiring
   stylesheet.css
   lib/format.js       bytes -> "4.2 GB"
-  lib/accumulator.js  deltas, counter resets, midnight rollover
+  lib/accumulator.js  deltas, counter resets, midnight rollover, startup recovery
   lib/counters.js     physical-interface discovery, sysfs reads
-  lib/store.js        load/save today's totals
+  lib/system.js       boot id and boot time, from procfs
+  lib/store.js        load/save the state file
 tests/run.js          test suite
 docs/superpowers/specs/  design document
 ```
 
-`format`, `accumulator` and `counters` contain all the logic and none of the
-shell: `counters` takes its sysfs root as an argument, and the other two are
-pure. That is what lets the tests run without a live session. `extension.js`
-is only wiring.
+`format`, `accumulator`, `counters` and `system` contain all the logic and none
+of the shell: `counters` and `system` take their sysfs and procfs roots as
+arguments, `accumulator.resume()` is pure data in and data out, and `format` is
+pure. That is what lets the tests run without a live session, including a
+walk-through of a full day with two boots. `extension.js` is only wiring.
 
 ## Development
 
 ```sh
-make test        # 31 tests under standalone gjs, no shell needed
+make test        # 56 tests under standalone gjs, no shell needed
 make dev-link    # symlink instead of copy, so edits land on the next shell restart
 make logs        # follow this extension's lines in the shell journal
 make state       # print the persisted totals
@@ -139,7 +159,10 @@ pick up the changes.
 - GNOME Shell 42 only. The extension uses the pre-45 `imports` module system,
   so GNOME 45 and later need it ported to ESM.
 - Counting is per machine, not per application.
-- Traffic during a reboot or shell restart is missed — seconds, in practice.
+- Traffic is lost only in two narrow cases: an unclean shutdown drops up to one
+  poll interval, and a machine left awake but logged out across midnight
+  cannot have its counter split at the boundary.
+- There is no way to reset the counter by hand. The number is a measurement.
 - Yesterday's number is gone at midnight. That was the point.
 
 ## License
